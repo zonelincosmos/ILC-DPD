@@ -1,260 +1,291 @@
-# Iterative Learning Control Digital Predistortion (ILC-DPD)
-
-## Technical Reference
+# 迭代學習控制數位預失真 (ILC-DPD) 技術手冊
 
 ---
 
-## 1. Introduction
+## 1. 緒論
 
-### 1.1 Power Amplifier Nonlinearity
+### 1.1 功率放大器的非線性問題
 
-A power amplifier (PA) is inherently nonlinear. As the input signal amplitude approaches saturation, the PA exhibits:
+功率放大器 (Power Amplifier, PA) 是無線發射機中不可或缺的元件，負責將信號放大至足夠的功率準位進行傳輸。然而，PA 本質上是非線性元件，當輸入信號振幅接近飽和區域時，會產生兩種主要失真：
 
-- **AM/AM distortion**: output amplitude compresses relative to the ideal linear gain.
-- **AM/PM distortion**: output phase rotates as a function of input amplitude.
+- **AM/AM 失真**（振幅對振幅轉換）：輸出振幅相對於理想線性增益產生壓縮。低振幅區域 PA 近似線性，但在高振幅區域輸出逐漸飽和，無法繼續按比例增長。
 
-These effects degrade modulation accuracy (EVM) and generate spectral regrowth (ACLR).
+- **AM/PM 失真**（振幅對相位轉換）：輸出信號的相位隨輸入振幅而改變。即使輸入信號的相位不變，PA 輸出的相位也會因振幅變化而旋轉。
 
-### 1.2 Digital Predistortion
+這兩種非線性效應會造成：
+- **調變精度劣化**：誤差向量幅度 (Error Vector Magnitude, EVM) 升高
+- **頻譜再生長**：鄰近通道洩漏比 (Adjacent Channel Leakage Ratio, ACLR) 惡化
 
-Digital predistortion (DPD) compensates PA nonlinearity by applying an inverse distortion to the input signal before the PA:
+### 1.2 數位預失真的基本概念
+
+數位預失真 (Digital Pre-Distortion, DPD) 的核心思想是：在信號進入 PA 之前，先施加一個與 PA 非線性「互補」的失真，使得信號經過 PA 後，兩者的非線性效應相互抵消，最終輸出近似於線性放大的結果。
 
 ```
 x(n) ──> [ DPD ] ──> p(n) ──> [ PA ] ──> y(n) ≈ G · x(n)
 ```
 
-where `G` is the desired linear gain.
+其中 `x(n)` 為原始輸入信號，`p(n)` 為預失真後的信號，`y(n)` 為 PA 輸出，`G` 為期望的線性增益。若 DPD 能完美補償 PA 非線性，則輸出 `y(n)` 應與 `G · x(n)` 一致。
 
-### 1.3 Model-Free vs. Model-Based DPD
+### 1.3 無模型方法 vs. 基於模型的方法
 
-**Model-based** approaches (memory polynomial, GMP, B-spline) fit a parametric predistortion function and deploy it as a lookup table or polynomial evaluator. The model is reusable for arbitrary input signals on the same PA.
+DPD 演算法大致可分為兩類：
 
-**Model-free (ILC-DPD)** iteratively adjusts the predistorted waveform sample-by-sample, using only measured PA output. No model structure is assumed. The result is a predistorted waveform valid for one specific input signal.
+**基於模型的方法**（如記憶多項式、GMP、B-spline）：
 
-This document describes the ILC-DPD algorithm, its theoretical foundation, noise handling, memory effect compensation, and comparative evaluation against B-spline and GMP approaches.
+建立一個參數化的預失真函數，透過最小二乘法等方式求解係數。訓練完成後，所得的模型（係數或查找表）可重複使用於相同 PA 上的任意信號。這類方法適用於即時通訊系統，能在數位前端持續運作。
 
----
+**無模型方法（ILC-DPD）**：
 
-## 2. PA Model
+不假設任何 PA 模型結構，而是透過反覆量測 PA 輸出，逐樣本 (sample-by-sample) 調整預失真波形。每次迭代都根據實際量測結果修正波形。最終結果是針對特定輸入信號的最佳預失真波形，而非通用模型。
 
-The example code (`IterativeDPD.m`) provides two PA simulation modes, selectable via the `pa_mode` parameter:
-
-- **`'memoryless'`** — Rapp AM/AM compression + AM/PM phase distortion. Output depends only on the current input sample: `y(n) = f(x(n))`.
-
-- **`'memory'`** — Wiener model: a 4-tap complex FIR filter followed by the memoryless Rapp PA. Output depends on the current and previous input samples: `y(n) = f(x(n), x(n-1), x(n-2), x(n-3))`. Memory effects cause the AM/AM characteristic to **spread** — the same input amplitude produces different output amplitudes depending on signal history.
-
-All PA model parameters are defined in the script and can be modified as needed. The ILC-DPD algorithm itself is PA-model-agnostic — it only requires the ability to transmit a signal and measure the PA output.
+本文件詳細描述 ILC-DPD 演算法的理論基礎、實作細節、雜訊處理、記憶效應補償，以及與 B-spline、GMP 等基於模型方法的比較評估。
 
 ---
 
-## 3. ILC-DPD Algorithm
+## 2. PA 模型
 
-### 3.1 Iterative Learning Control Framework
+本專案的範例程式碼 (`IterativeDPD.m`) 提供兩種 PA 模擬模式，可透過 `pa_mode` 參數切換：
 
-The ILC-DPD formulation treats predistortion as an iterative optimization problem [1][2]:
+- **`'memoryless'`**（無記憶效應）：Rapp AM/AM 壓縮模型加上有理函數 AM/PM 相位失真。輸出僅取決於當前輸入樣本 `y(n) = f(x(n))`。AM/AM 曲線為單一確定曲線——相同的輸入振幅永遠對應相同的輸出振幅。
 
-> Given a desired PA output `y_d(n)`, find a predistorted input `p(n)` such that `PA(p(n)) = y_d(n)`, without requiring a parametric model of the PA.
+- **`'memory'`**（含記憶效應）：Wiener 模型——由 4 抽頭複數 FIR 濾波器串接無記憶 Rapp PA 組成。輸出取決於當前及先前的輸入樣本 `y(n) = f(x(n), x(n-1), x(n-2), x(n-3))`。記憶效應導致 AM/AM 特性出現**散佈 (spread)**——相同的輸入振幅因信號歷史不同而產生不同的輸出振幅。
 
-The standard **additive ILC** update [1] is:
+所有 PA 模型參數均定義於腳本中，可依需求修改。ILC-DPD 演算法本身與 PA 模型無關——它只需要能夠發射信號並量測 PA 輸出的能力。
+
+---
+
+## 3. ILC-DPD 演算法
+
+### 3.1 迭代學習控制架構
+
+ILC-DPD 將預失真問題建構為迭代最佳化問題 [1][2]：
+
+> 給定期望的 PA 輸出 `y_d(n)`，在不需要 PA 參數化模型的條件下，找到預失真輸入 `p(n)` 使得 `PA(p(n)) = y_d(n)`。
+
+文獻中存在兩種等價的迭代更新公式：
+
+**加法型 ILC 更新** [1]：
 
 ```
 p_{k+1}(n) = p_k(n) + L · ( y_d(n) - y_k(n) )
 ```
 
-where `y_k(n) = PA(p_k(n))` is the measured output at iteration `k`, and `L` is the learning gain.
+其中 `y_k(n) = PA(p_k(n))` 為第 `k` 次迭代的量測輸出，`L` 為學習增益。此公式直接將輸出誤差回饋至輸入——若 PA 輸出低於目標，則增加輸入；若高於目標，則減少輸入。收斂條件為 `0 < L < 2/G_ss`，其中 `G_ss` 為 PA 小信號增益 [1]。
 
-An equivalent **multiplicative** formulation is:
+**乘法型更新**（本實作採用）：
 
 ```
 p_{k+1}(n) = p_k(n) · y_d(n) / y_k(n)
 ```
 
-which applies per-sample complex gain correction. This form naturally handles both AM/AM and AM/PM compensation in a single operation [3].
+此公式透過逐樣本的複數增益修正 (complex gain correction)，在一次運算中同時補償 AM/AM 和 AM/PM [3]。其物理意義清晰：
 
-Both forms converge under appropriate conditions. The multiplicative form requires `|y_k(n)| > 0` (addressed by numerical safeguards), while the additive form requires `0 < L < 2/G_ss` for stability [1].
+- 若 `|y_k(n)| < |y_d(n)|`（PA 壓縮，輸出不足）：比值 > 1，增加驅動
+- 若 `|y_k(n)| > |y_d(n)|`（過度驅動）：比值 < 1，降低驅動
+- 若 `∠y_k(n) ≠ ∠y_d(n)`（相位偏移）：複數除法自動旋轉相位補償
 
-### 3.2 Algorithm Detail
+當 `y_k(n) = y_d(n)` 時，比值 = 1，預失真信號不再改變——即已達收斂。
 
-The implementation uses the multiplicative formulation with a learning rate `μ` and I/Q averaging.
+### 3.2 演算法詳細步驟
 
-**Initialization:**
+本實作採用乘法型更新公式，並引入學習率 `μ` 與 I/Q 平均以提高穩健性。
+
+#### 步驟 0：初始化
 
 ```
-p_0(n) = x(n)      (identity — no predistortion)
+p_0(n) = x(n)      （恆等映射，尚未施加預失真）
 ```
 
-**Saturation probe:** Before training, empirically determine:
-- `P_sat`: maximum achievable PA output amplitude (drive PA at `r_cap`, observe output)
-- `r_drive_max`: PA input amplitude that produces `P_sat` (beyond this, PA output cannot increase)
+#### 步驟 0.5：飽和探測 (Saturation Probe)
 
-**Iteration k = 1, 2, ..., K:**
+在正式訓練前，需經驗性地確定 PA 的飽和特性。此步驟不需要 PA 模型——純粹透過實際量測完成：
 
-**(a) I/Q-averaged capture.** Transmit `p_k` through the PA `N_avg` times with independent noise realizations, and average:
+1. 以最大硬體輸入振幅 `r_cap` 驅動 PA
+2. 觀測最大輸出 → `P_sat = max(|PA(x_probe)|) × 0.99`
+3. 找到對應的輸入振幅 → `r_drive_max`：使 PA 輸出恰好達到 `P_sat` 的輸入振幅
+
+超過 `r_drive_max` 的驅動將無法增加 PA 輸出（已飽和），因此預失真信號必須被箝位 (clamp) 在此範圍內。
+
+#### 迭代 k = 1, 2, ..., K：
+
+**(a) I/Q 平均擷取**
+
+將當前預失真信號 `p_k` 通過 PA 傳輸 `N_avg` 次，每次加入獨立的雜訊實現，然後取平均：
 
 ```
 y_bar_k(n) = (1 / N_avg) · Σ_{j=1}^{N_avg} [ PA(p_k(n)) + w_j(n) ]
 ```
 
-where `w_j(n)` is AWGN. Averaging reduces noise variance by factor `N_avg`.
+其中 `w_j(n)` 為加性高斯白雜訊 (AWGN)。平均可將雜訊變異量降低 `N_avg` 倍。
 
-**(b) Target computation.** The desired output is linear up to `P_sat`, hard-clipped beyond:
+**(b) 計算目標輸出**
+
+期望輸出為線性放大直到 `P_sat`，超過則硬限幅 (hard-clip)：
 
 ```
 y_d(n) = min( G · |x(n)|, P_sat ) / |x(n)| · x(n)
 ```
 
-Samples where `G · |x(n)| > P_sat` cannot be linearized (PA physical limit).
+振幅超過 `P_sat / G` 的樣本無法被線性化——這是 PA 的物理極限，而非演算法的限制。
 
-**(c) Multiplicative correction.** Per-sample complex ratio with learning rate `μ`:
+**(c) 乘法型修正**
+
+逐樣本複數比值修正，引入學習率 `μ` 控制收斂速度：
 
 ```
 p_{k+1}(n) = p_k(n) · [ (1 - μ) + μ · y_d(n) / y_bar_k(n) ]
 ```
 
-The safe complex division separates magnitude and phase:
+安全的複數除法將振幅與相位分離處理，避免除以零：
 
 ```
-y_d / y_bar = (|y_d| / |y_bar|) · exp( j · (∠y_d − ∠y_bar) )
+y_d / y_bar = (|y_d| / |y_bar|) · exp( j · (∠y_d - ∠y_bar) )
 ```
 
-**(d) Drive clamping.**
+在 MATLAB 中實作為：`y_d ./ max(|y_bar|, epsilon) .* exp(-j * angle(y_bar))`
+
+**(d) 驅動箝位**
+
+防止預失真信號超過 PA 的有效輸入範圍：
 
 ```
 p_{k+1}(n) ← p_{k+1}(n) · min(1, r_drive_max / |p_{k+1}(n)|)
 ```
 
-**(e) MSE evaluation** (noise-free, measures DPD quality):
+超過 `r_drive_max` 的驅動無法增加 PA 輸出，只會造成浪費並可能損壞元件。
+
+**(e) MSE 評估**
+
+以無雜訊的方式評估 DPD 品質（量測的是預失真效果，而非雜訊底限）：
 
 ```
-MSE_k = (1/N) · Σ_{n=1}^{N} | PA(p_k(n)) − G · x(n) |²
+MSE_k = (1/N) · Σ_{n=1}^{N} | PA(p_k(n)) - G · x(n) |²
 ```
 
-### 3.3 Convergence Properties
+### 3.3 收斂特性
 
-From contraction mapping theory [4], the multiplicative iteration converges when the map `p → p · y_d / PA(p)` is a contraction.
+根據壓縮映射 (contraction mapping) 理論 [4]，乘法型迭代在映射 `p → p · y_d / PA(p)` 為壓縮映射時保證收斂。
 
-In practice:
-- **Iterations 1–3**: Rapid MSE reduction (~10–20 dB), dominant nonlinearity corrected.
-- **Iterations 3–10**: Gradual refinement of residual distortion near the saturation boundary.
-- **Beyond 10**: Diminishing returns, limited by `P_sat` hard-clip and noise floor.
+實際觀察到的收斂行為：
 
-Typical convergence: 20–25 dB MSE improvement within 20 iterations for a memoryless PA.
+- **迭代 1–3**：MSE 快速下降（約 10–20 dB），主要非線性效應被修正
+- **迭代 3–10**：逐步改善飽和邊界附近的殘餘失真
+- **迭代 10 以後**：改善幅度遞減，受限於 `P_sat` 硬限幅和雜訊底限
 
-### 3.4 Memory Effect Handling
+典型結果：無記憶 PA 在 20 次迭代內可達 20–25 dB 的 MSE 改善。
 
-A key advantage of ILC-DPD over model-based methods: **memory effects require no explicit modeling**.
+### 3.4 記憶效應的處理
 
-The measured output `y_bar_k(n)` already incorporates all memory effects from the current predistorted waveform `p_k`. The per-sample correction adjusts `p_k(n)` based on the actual PA response, including contributions from neighboring samples `p_k(n-1), p_k(n-2), ...`
+ILC-DPD 相較於基於模型方法的關鍵優勢：**記憶效應無需顯式建模**。
 
-Modifying `p_k(n)` perturbs the output at `n+1, n+2, ...` through the memory taps. These cross-sample effects are corrected in subsequent iterations. More iterations are needed for convergence (30 vs. 20 for memoryless PA) due to this coupling.
+量測輸出 `y_bar_k(n)` 已經包含了當前預失真波形 `p_k` 造成的所有記憶效應。演算法根據實際 PA 回應來調整 `p_k(n)`，自然涵蓋了來自鄰近樣本 `p_k(n-1), p_k(n-2), ...` 的貢獻。
 
-Model-based methods (B-spline, GMP) must explicitly add memory polynomial terms and cross-terms, increasing complexity with memory depth.
+修改 `p_k(n)` 會透過記憶效應擾動 `n+1, n+2, ...` 位置的輸出。這些交叉影響在後續迭代中被修正。因此含記憶效應的 PA 需要更多迭代才能收斂（30 次 vs. 無記憶的 20 次），這是因為樣本間的耦合需要更多輪次來穩定。
+
+基於模型的方法（B-spline、GMP）若要處理記憶效應，必須顯式地加入記憶多項式項 `x(n-q) · |x(n-q)|^(p-1)` 以及交叉項，使得複雜度隨記憶深度增長。
 
 ---
 
-## 4. Noise Considerations
+## 4. 雜訊考量
 
-### 4.1 Noise Sensitivity
+### 4.1 無模型方法的雜訊敏感性
 
-ILC-DPD adjusts each of `N` samples independently. Without smoothing from a model fit (`K << N` parameters), measurement noise directly corrupts the predistorted waveform. This is the fundamental trade-off of model-free operation.
+ILC-DPD 獨立地調整每個樣本（共 `N` 個）。不像基於模型的方法以 `K << N` 個參數擬合 `N` 個資料點（超定系統天然具有平滑效果），無模型方法中量測雜訊會直接污染預失真波形。這是無模型操作的根本取捨。
 
-### 4.2 I/Q Averaging
+### 4.2 I/Q 平均
 
-Averaging `N_avg` independent captures reduces noise power by factor `N_avg`:
+對 `N_avg` 次獨立擷取取平均，可將雜訊功率降低 `N_avg` 倍：
 
 ```
 Var(y_bar) = Var(y_single) / N_avg
-SNR_eff    = SNR + 10·log10(N_avg)
+SNR_eff    = SNR + 10 · log10(N_avg)
 ```
 
-With `N_avg = 8`: effective SNR improves by 9 dB.
+以 `N_avg = 8` 為例：等效 SNR 改善 9 dB（從 30 dB 提升至 39 dB）。
 
-### 4.3 Learning Rate
+### 4.3 學習率
 
-The parameter `μ < 1` provides additional damping:
+參數 `μ < 1` 提供額外的阻尼效果，降低單次修正幅度：
 
-- `μ = 1.0`: full correction per iteration (fastest, most noise-sensitive).
-- `μ = 0.5`: half correction (slower convergence, more robust to noise).
-- `μ = 0.8`: recommended balance for typical SNR conditions.
-
----
-
-## 5. Comparison with Model-Based DPD
-
-### 5.1 Methods Compared
-
-Three DPD approaches are evaluated on the same memoryless PA, waveform, and noise conditions. See `DPD_Comparison.m`.
-
-**ILC-DPD (this work):**
-Per-sample multiplicative correction, `μ = 0.8`, `N_avg = 8`.
-
-**B-spline DPD:**
-Complex gain model with degree-3 cubic B-splines, 11 uniform break points, K=13 basis functions. Trained via weighted least squares (WLS).
-
-**GMP DPD (memoryless polynomial):**
-Odd-order polynomial gain model, orders {1, 3, 5, 7, 9}, K=5 coefficients. Same WLS training.
-
-### 5.2 Experimental Results
-
-Memoryless PA, 20 iterations, SNR = 30 dB, N = 30976 samples.
-
-| Method | Final MSE | Improvement | Parameters |
-|--------|-----------|-------------|------------|
-| No DPD | 4.44e-03 | — | — |
-| ILC-DPD | 3.43e-05 | 21.1 dB | N samples |
-| GMP (K=5) | 4.74e-05 | 19.7 dB | 5 complex coeff. |
-| B-spline (K=13) | 5.50e-05 | 19.1 dB | 13 complex coeff. |
-
-### 5.3 Analysis
-
-ILC-DPD achieves the lowest MSE because each sample is individually optimized with no model approximation error. I/Q averaging provides an effective SNR of 39 dB (30 + 9 dB from N_avg=8), exceeding the single-capture SNR of 30 dB available to the model-based methods.
-
-GMP outperforms B-spline because its 5 polynomial coefficients are more robust to noise than 13 B-spline coefficients. With noisy training data, the additional degrees of freedom in the B-spline model can lead to slightly higher residual error.
-
-### 5.4 Trade-off Summary
-
-| Aspect | ILC-DPD | B-spline | GMP |
-|--------|---------|----------|-----|
-| MSE | Best | Good | Better |
-| Reusable across signals | No | Yes | Yes |
-| Memory effect handling | Implicit | Requires memory taps | Requires memory taps |
-| HW deployment | Full waveform storage | LUT / coefficients | LUT / coefficients |
-| Noise robustness | I/Q averaging | Model smoothing | Model smoothing |
-| Computation per iter | O(N) | O(K²N) | O(K²N) |
-
-### 5.5 Application Scenarios
-
-**ILC-DPD** is suited for test and calibration workflows where a known waveform is transmitted repeatedly: signal generator calibration, type-approval testing, one-time PA characterization. Commercial signal generators from multiple vendors implement this approach.
-
-**B-spline / GMP** are suited for real-time production transmitters (WiFi, cellular) where the DPD must compensate arbitrary data-bearing signals. The trained model is deployed as a lookup table or polynomial evaluator in the digital front-end.
+- `μ = 1.0`：每次迭代完全修正。收斂最快，但最容易受雜訊影響
+- `μ = 0.5`：半修正。收斂較慢，但對雜訊更穩健
+- `μ = 0.8`：推薦值，在典型 SNR 條件下取得速度與穩定性的平衡
 
 ---
 
-## 6. Parameters
+## 5. 與基於模型 DPD 方法的比較
 
-| Parameter | Symbol | Value | Description |
-|-----------|--------|-------|-------------|
-| Iterations | K | 20 / 30 | Memoryless / memory PA |
-| Learning rate | μ | 0.8 | Correction damping factor |
-| I/Q averages | N_avg | 8 | Captures per iteration |
-| Noise SNR | — | 30 dB | ADC measurement noise |
-| Target gain | G | 1.0 | Desired linear gain |
-| Probe drive | r_cap | 1.8 | Saturation probe amplitude |
-| PA mode | — | `'memoryless'` / `'memory'` | Model selection |
+### 5.1 比較方法
+
+三種 DPD 方法在相同的無記憶 PA、相同波形、相同雜訊條件下進行評估。詳見 `DPD_Comparison.m`。
+
+**ILC-DPD（本實作）**：逐樣本乘法型修正，`μ = 0.8`，`N_avg = 8`。
+
+**B-spline DPD**：複數增益模型，3 階 (cubic) B-spline 基底函數，11 個均勻斷點，K=13 個基底。透過加權最小二乘法 (WLS) 訓練。
+
+**GMP DPD（無記憶多項式）**：奇數階多項式增益模型，階數 {1, 3, 5, 7, 9}，K=5 個係數。採用相同的 WLS 訓練。
+
+### 5.2 實驗結果
+
+無記憶 PA、20 次迭代、SNR = 30 dB、N = 30976 個樣本。
+
+| 方法 | 最終 MSE | 改善量 | 參數量 |
+|------|----------|--------|--------|
+| 無 DPD | 4.44e-03 | — | — |
+| ILC-DPD | 3.43e-05 | 21.1 dB | N 個樣本 |
+| GMP (K=5) | 4.74e-05 | 19.7 dB | 5 個複數係數 |
+| B-spline (K=13) | 5.50e-05 | 19.1 dB | 13 個複數係數 |
+
+### 5.3 結果分析
+
+ILC-DPD 達到最低 MSE，原因在於每個樣本均被個別最佳化，不存在模型近似誤差。此外，I/Q 平均提供了 39 dB 的等效 SNR（30 + 9 dB），優於基於模型方法所使用的單次 30 dB 擷取。
+
+GMP 優於 B-spline，因為其 5 個多項式係數在雜訊環境下比 13 個 B-spline 係數更為穩健。在含雜訊的訓練資料中，B-spline 較多的自由度反而導致些許更高的殘餘誤差。
+
+### 5.4 取捨總結
+
+| 面向 | ILC-DPD | B-spline | GMP |
+|------|---------|----------|-----|
+| MSE 表現 | 最佳 | 良好 | 較佳 |
+| 跨信號可重複使用 | 否 | 是 | 是 |
+| 記憶效應處理 | 隱式（自動） | 需顯式記憶項 | 需顯式記憶項 |
+| 硬體部署 | 需儲存完整波形 | 查找表 / 係數 | 查找表 / 係數 |
+| 雜訊穩健性 | 依賴 I/Q 平均 | 模型擬合平滑 | 模型擬合平滑 |
+| 每次迭代計算量 | O(N) | O(K²N) | O(K²N) |
+
+### 5.5 適用場景
+
+**ILC-DPD** 適用於測試與校準流程——已知波形被重複傳輸的場景，例如：信號產生器校準、型式認證測試、一次性 PA 特性量測。多家商用信號產生器廠商已實作此方法。
+
+**B-spline / GMP** 適用於即時生產型發射機（WiFi、行動通訊），DPD 必須補償任意資料承載信號。訓練後的模型以查找表或多項式求值器的形式部署於數位前端。
 
 ---
 
-## 7. File Inventory
+## 6. 參數表
 
-| File | Description |
-|------|-------------|
-| `IterativeDPD.m` | ILC-DPD implementation with memoryless/memory PA selection |
-| `DPD_Comparison.m` | Three-method comparison: ILC-DPD vs. B-spline vs. GMP |
-| `IterativeDPD_Guide.md` | This document |
+| 參數 | 符號 | 值 | 說明 |
+|------|------|-----|------|
+| 迭代次數 | K | 20 / 30 | 無記憶 / 含記憶 PA |
+| 學習率 | μ | 0.8 | 修正阻尼係數 |
+| I/Q 平均次數 | N_avg | 8 | 每次迭代的擷取次數 |
+| 雜訊 SNR | — | 30 dB | ADC 量測雜訊 |
+| 目標增益 | G | 1.0 | 期望線性增益 |
+| 探測驅動 | r_cap | 1.8 | 飽和探測振幅 |
+| PA 模式 | — | `'memoryless'` / `'memory'` | 模型選擇 |
 
 ---
 
-## 8. References
+## 7. 檔案清單
+
+| 檔案 | 說明 |
+|------|------|
+| `IterativeDPD.m` | ILC-DPD 實作，支援無記憶/含記憶 PA 切換 |
+| `DPD_Comparison.m` | 三種方法比較：ILC-DPD vs. B-spline vs. GMP |
+| `IterativeDPD_Guide.md` | 本文件 |
+
+---
+
+## 8. 參考文獻
 
 [1] J. Chani-Cahuana, P. N. Landin, C. Fager, and T. Eriksson, "Iterative Learning Control for RF Power Amplifier Linearization," *IEEE Trans. Microw. Theory Techn.*, vol. 64, no. 9, pp. 2778–2789, Sept. 2016.
 
